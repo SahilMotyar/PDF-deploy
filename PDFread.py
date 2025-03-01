@@ -8,14 +8,14 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-import PyPDF2
+# Use pdfplumber instead of PyPDF2
+import pdfplumber
 import io
 from transformers import pipeline
 import nltk
 import textwrap
 import time
 import base64
-import signal
 from threading import Timer
 
 # Download NLTK punkt package
@@ -35,26 +35,37 @@ def timeout_handler():
 class PDFAssistant:
     def __init__(self):
         # Initialize the summarization pipeline with smaller, faster models
-        # Use GPU (device=0) instead of CPU (device=-1)
+        # Note: For Streamlit deployment, device=0 (GPU) might not be available
+        # Defaulting to CPU (device=-1) for better compatibility
         with st.spinner("Loading AI models..."):
-            self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=0)
-            self.qa_pipeline = pipeline("question-answering", model="distilbert-base-cased-distilled-squad", device=0)
+            try:
+                # Try GPU first
+                self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=0)
+                self.qa_pipeline = pipeline("question-answering", model="distilbert-base-cased-distilled-squad", device=0)
+            except:
+                # Fall back to CPU if GPU not available
+                self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=-1)
+                self.qa_pipeline = pipeline("question-answering", model="distilbert-base-cased-distilled-squad", device=-1)
         self.pdf_text = ""
         self.summary = ""
         
     def read_pdf(self, pdf_file):
-        """Extract text from a PDF file."""
+        """Extract text from a PDF file using pdfplumber."""
         try:
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            pdf_bytes = pdf_file.read()
+            pdf_file.seek(0)  # Reset file pointer after reading
+            
             self.pdf_text = ""
             
-            total_pages = len(pdf_reader.pages)
-            progress_bar = st.progress(0)
-            
-            for page_num in range(total_pages):
-                page = pdf_reader.pages[page_num]
-                self.pdf_text += page.extract_text()
-                progress_bar.progress((page_num + 1) / total_pages)
+            # Use pdfplumber to read the PDF
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                total_pages = len(pdf.pages)
+                progress_bar = st.progress(0)
+                
+                for page_num, page in enumerate(pdf.pages):
+                    page_text = page.extract_text() or ""
+                    self.pdf_text += page_text
+                    progress_bar.progress((page_num + 1) / total_pages)
             
             return f"PDF loaded successfully. Contains {len(self.pdf_text)} characters and {total_pages} pages."
         except Exception as e:
@@ -307,7 +318,7 @@ def main():
         - BART for summarization
         - DistilBERT for question answering
         - NLTK for text processing
-        - GPU acceleration
+        - pdfplumber for PDF extraction
         """)
         
         st.divider()
@@ -315,7 +326,7 @@ def main():
         **Performance Tips:**
         - Smaller PDFs work faster
         - Technical documents work better than scanned or image-heavy PDFs
-        - GPU acceleration is enabled for faster processing
+        - GPU acceleration is used if available
         """)
     
     # Main content area - tabs for Summary and Q&A
