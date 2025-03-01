@@ -1,4 +1,5 @@
 import streamlit as st
+import torch
 
 # Set page config at the very top, before any other Streamlit commands
 st.set_page_config(
@@ -8,22 +9,22 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Use pdfplumber instead of PyPDF2
+# Simplified imports - avoid incompatible libraries
 import pdfplumber
 import io
-from transformers import pipeline
-import nltk
-import textwrap
 import time
 import base64
+import nltk
 from threading import Timer
 
-# Download NLTK punkt package
-@st.cache_resource
-def download_nltk_resources():
-    nltk.download('punkt')
+# Use a simplified approach to avoid transformers pipeline issues
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoModelForQuestionAnswering
 
-download_nltk_resources()
+# Download NLTK punkt package
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
 from nltk.tokenize import sent_tokenize
 
 class TimeoutException(Exception):
@@ -34,20 +35,42 @@ def timeout_handler():
 
 class PDFAssistant:
     def __init__(self):
-        # Initialize the summarization pipeline with smaller, faster models
-        # Note: For Streamlit deployment, device=0 (GPU) might not be available
-        # Defaulting to CPU (device=-1) for better compatibility
+        # Initialize models - using a more compatibility-focused approach
         with st.spinner("Loading AI models..."):
             try:
-                # Try GPU first
-                self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=0)
-                self.qa_pipeline = pipeline("question-answering", model="distilbert-base-cased-distilled-squad", device=0)
-            except:
-                # Fall back to CPU if GPU not available
-                self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=-1)
-                self.qa_pipeline = pipeline("question-answering", model="distilbert-base-cased-distilled-squad", device=-1)
+                # Load summarization model
+                self.summarizer_model = None
+                self.summarizer_tokenizer = None
+                self.qa_model = None
+                self.qa_tokenizer = None
+                
+                # We'll load models only when needed to save memory
+                self.models_loaded = False
+            except Exception as e:
+                st.error(f"Error initializing models: {str(e)}")
+        
         self.pdf_text = ""
         self.summary = ""
+    
+    def _load_models(self):
+        """Load AI models when needed"""
+        if not self.models_loaded:
+            try:
+                # Load smaller, faster models for Streamlit compatibility
+                with st.spinner("Loading AI models (first use)..."):
+                    # For summarization - use T5-small instead of BART (more compatible)
+                    self.summarizer_tokenizer = AutoTokenizer.from_pretrained("t5-small")
+                    self.summarizer_model = AutoModelForSeq2SeqLM.from_pretrained("t5-small")
+                    
+                    # For QA - use a smaller model
+                    self.qa_tokenizer = AutoTokenizer.from_pretrained("distilbert-base-cased-distilled-squad")
+                    self.qa_model = AutoModelForQuestionAnswering.from_pretrained("distilbert-base-cased-distilled-squad")
+                
+                self.models_loaded = True
+            except Exception as e:
+                st.error(f"Error loading models: {str(e)}")
+                return False
+        return True
         
     def read_pdf(self, pdf_file):
         """Extract text from a PDF file using pdfplumber."""
@@ -64,12 +87,34 @@ class PDFAssistant:
                 
                 for page_num, page in enumerate(pdf.pages):
                     page_text = page.extract_text() or ""
-                    self.pdf_text += page_text
+                    self.pdf_text += page_text + "\n"
                     progress_bar.progress((page_num + 1) / total_pages)
             
             return f"PDF loaded successfully. Contains {len(self.pdf_text)} characters and {total_pages} pages."
         except Exception as e:
             return f"Error reading PDF: {str(e)}"
+    
+    def _summarize_text(self, text):
+        """Summarize a chunk of text using the model."""
+        if not self._load_models():
+            return "Failed to load AI models."
+            
+        # Prepare the input for T5 (expects "summarize: " prefix)
+        inputs = self.summarizer_tokenizer("summarize: " + text, return_tensors="pt", max_length=512, truncation=True)
+        
+        # Generate summary
+        summary_ids = self.summarizer_model.generate(
+            inputs.input_ids, 
+            max_length=100, 
+            min_length=30,
+            length_penalty=2.0,
+            num_beams=4,
+            early_stopping=True
+        )
+        
+        # Decode the summary
+        summary = self.summarizer_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+        return summary
     
     def generate_summary(self):
         """Generate a summary of the PDF content."""
@@ -77,8 +122,8 @@ class PDFAssistant:
             return "Please load a PDF first."
         
         try:
-            # Break the text into manageable chunks for the summarizer
-            chunks = self._split_text(self.pdf_text, max_length=1000, overlap=100)
+            # Break the text into manageable chunks
+            chunks = self._split_text(self.pdf_text, max_length=500, overlap=50)
             
             if not chunks:
                 return "Unable to extract meaningful text from the PDF."
@@ -101,8 +146,8 @@ class PDFAssistant:
                     timer = Timer(60, timeout_handler)  # 60 second timeout
                     timer.start()
                     try:
-                        chunk_summary = self.summarizer(chunk, max_length=100, min_length=30, do_sample=False)
-                        summaries.append(chunk_summary[0]['summary_text'])
+                        chunk_summary = self._summarize_text(chunk)
+                        summaries.append(chunk_summary)
                     except TimeoutException:
                         timeout_flag = True
                         st.warning(f"Chunk {i+1} took too long to summarize. Skipping.")
@@ -126,6 +171,31 @@ class PDFAssistant:
             st.error(f"Error in summary generation: {str(e)}")
             return "An error occurred while generating the summary."
     
+    def _answer_question_from_context(self, question, context):
+        """Answer a question based on the given context."""
+        if not self._load_models():
+            return "Failed to load AI models.", 0
+
+        # Tokenize the input
+        inputs = self.qa_tokenizer(question, context, return_tensors="pt", 
+                                  truncation=True, max_length=512,
+                                  padding="max_length")
+        
+        # Get the answer
+        with torch.no_grad():
+            outputs = self.qa_model(**inputs)
+            answer_start = torch.argmax(outputs.start_logits)
+            answer_end = torch.argmax(outputs.end_logits) + 1
+            answer = self.qa_tokenizer.convert_tokens_to_string(
+                self.qa_tokenizer.convert_ids_to_tokens(inputs.input_ids[0][answer_start:answer_end])
+            )
+        
+        # Calculate confidence score (simplified)
+        confidence = float(torch.max(outputs.start_logits).item() + torch.max(outputs.end_logits).item()) / 2
+        normalized_conf = min(1.0, max(0.0, confidence / 10.0))  # Normalize to 0-1
+        
+        return answer, normalized_conf
+    
     def answer_question(self, question):
         """Answer a question based on the PDF content."""
         if not self.pdf_text:
@@ -135,8 +205,11 @@ class PDFAssistant:
             return "Please enter a valid question."
         
         try:
+            # Add torch import here to avoid issues with module not available at top level
+            import torch
+            
             # For long documents, find the most relevant sections
-            chunks = self._split_text(self.pdf_text, max_length=4000, overlap=400)
+            chunks = self._split_text(self.pdf_text, max_length=1000, overlap=100)
             
             if not chunks:
                 return "Unable to extract meaningful text from the PDF to answer questions."
@@ -157,11 +230,11 @@ class PDFAssistant:
                     timer = Timer(30, timeout_handler)  # 30 second timeout per chunk
                     timer.start()
                     try:
-                        result = self.qa_pipeline(question=question, context=chunk)
+                        answer, score = self._answer_question_from_context(question, chunk)
                         
-                        if result['score'] > highest_score:
-                            highest_score = result['score']
-                            best_answer = result['answer']
+                        if score > highest_score and len(answer.strip()) > 0:
+                            highest_score = score
+                            best_answer = answer
                     except TimeoutException:
                         timeout_flag = True
                         st.warning(f"Chunk {i+1} took too long to process. Skipping.")
@@ -315,7 +388,7 @@ def main():
         
         Powered by:
         - Hugging Face Transformers
-        - BART for summarization
+        - T5 for summarization
         - DistilBERT for question answering
         - NLTK for text processing
         - pdfplumber for PDF extraction
@@ -326,7 +399,7 @@ def main():
         **Performance Tips:**
         - Smaller PDFs work faster
         - Technical documents work better than scanned or image-heavy PDFs
-        - GPU acceleration is used if available
+        - Models are loaded only when needed to improve performance
         """)
     
     # Main content area - tabs for Summary and Q&A
