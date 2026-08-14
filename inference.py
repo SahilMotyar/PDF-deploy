@@ -26,9 +26,11 @@ SUMMARIZER_MODEL = "t5-small"
 QA_MODEL = "distilbert-base-cased-distilled-squad"
 
 # Both models take 512 tokens. Leave headroom for special tokens and, for T5,
-# the "summarize: " task prefix.
+# the "summarize: " task prefix. The QA budget is smaller because the question
+# shares the window with the context; overshooting would silently truncate the
+# tail of every chunk.
 SUMMARY_INPUT_TOKENS = 480
-QA_INPUT_TOKENS = 480
+QA_INPUT_TOKENS = 440
 
 # Sentences of overlap context carried between adjacent chunks.
 OVERLAP_TOKENS = 48
@@ -58,6 +60,9 @@ class Budget:
     That raises on the *timer* thread, where the caller's ``except`` clause can
     never catch it, so the timeout never worked and every chunk leaked a
     thread. Checking a deadline between batches is both correct and free.
+
+    Granularity is one batch: an in-flight batch always finishes, so the wall
+    clock can overshoot the budget by roughly one batch's duration.
     """
 
     def __init__(self, seconds: float | None):
@@ -91,9 +96,14 @@ def quantization_enabled() -> bool:
 def prepare(model, quantize: bool | None = None):
     """Put a model into inference shape.
 
-    ``eval()`` disables dropout, which was never turned off. Dynamic int8
-    quantisation replaces Linear weights with int8 and is the single biggest
-    CPU win available without changing models.
+    ``eval()`` disables dropout, which the original code never turned off.
+
+    Dynamic int8 quantisation is worth about 1.24x on top of batching (7.93s
+    to 6.38s on the benchmark). Note that torch 2.13 emits a DeprecationWarning
+    for the quantized tensor constructors this path uses, and PyTorch intends
+    to remove them (pytorch/pytorch#184982). It still works today, it is worth
+    the gain, and ``PDFREAD_QUANTIZE=0`` turns it off; when it is finally
+    removed the replacement is torchao. Failure to quantise is never fatal.
     """
     import torch
 
