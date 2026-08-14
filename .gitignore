@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Generated benchmark fixtures - rebuild with benchmarks/make_fixture.py,
+# which is seeded and reproducible.
+benchmarks/fixture_*.pdf
+
+# Model / data caches
+.cache/
+nltk_data/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

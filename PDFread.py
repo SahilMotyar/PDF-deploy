@@ -1,5 +1,7 @@
+import base64
+from threading import Timer
+
 import streamlit as st
-import torch
 
 # Set page config at the very top, before any other Streamlit commands
 st.set_page_config(
@@ -9,23 +11,87 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Simplified imports - avoid incompatible libraries
-import pdfplumber
-import io
-import time
-import base64
-import nltk
-from threading import Timer
+import pdf_extract
 
-# Use a simplified approach to avoid transformers pipeline issues
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoModelForQuestionAnswering
+SUMMARIZER_MODEL = "t5-small"
+QA_MODEL = "distilbert-base-cased-distilled-squad"
 
-# Download NLTK punkt package
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
-from nltk.tokenize import sent_tokenize
+# torch and transformers are imported inside the loaders below rather than at
+# module scope. They cost seconds to import, and Streamlit's file watcher is
+# known to trip over torch's custom class registry when it is imported eagerly.
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_sentence_tokenizer():
+    """Fetch the NLTK sentence tokenizer once per process, not once per rerun."""
+    import nltk
+
+    # NLTK 3.9 replaced the `punkt` data package with `punkt_tab`. Accept
+    # either so the app works across versions.
+    for package in ("punkt_tab", "punkt"):
+        try:
+            nltk.data.find(f"tokenizers/{package}")
+            return True
+        except LookupError:
+            continue
+
+    for package in ("punkt_tab", "punkt"):
+        try:
+            if nltk.download(package, quiet=True):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+@st.cache_resource(show_spinner="Loading the summarisation model...")
+def load_summarizer():
+    """Load T5 once per process and share it across every session."""
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+    return (
+        AutoTokenizer.from_pretrained(SUMMARIZER_MODEL),
+        AutoModelForSeq2SeqLM.from_pretrained(SUMMARIZER_MODEL),
+    )
+
+
+@st.cache_resource(show_spinner="Loading the question-answering model...")
+def load_qa():
+    """Load DistilBERT once per process and share it across every session."""
+    from transformers import AutoModelForQuestionAnswering, AutoTokenizer
+
+    return (
+        AutoTokenizer.from_pretrained(QA_MODEL),
+        AutoModelForQuestionAnswering.from_pretrained(QA_MODEL),
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def extract_pdf_cached(pdf_bytes, _progress=None):
+    """Extract text from a PDF, keyed on the file's content.
+
+    Re-uploading or re-processing the same document is served from cache.
+    `_progress` is underscore-prefixed so Streamlit excludes it from the key.
+    """
+    return pdf_extract.extract(pdf_bytes, _progress)
+
+
+def throttled_progress(bar, step=0.02):
+    """Return a progress callback that only redraws every `step` of the way.
+
+    Each `st.progress` call is a websocket round-trip, so updating on every
+    page of a long document costs more than the extraction itself.
+    """
+    last = {"fraction": -1.0}
+
+    def report(done, total):
+        fraction = done / total if total else 1.0
+        if fraction - last["fraction"] >= step or done >= total:
+            last["fraction"] = fraction
+            bar.progress(min(1.0, fraction))
+
+    return report
+
 
 class TimeoutException(Exception):
     pass
@@ -35,62 +101,43 @@ def timeout_handler():
 
 class PDFAssistant:
     def __init__(self):
-        # Initialize models - using a more compatibility-focused approach
-        with st.spinner("Loading AI models..."):
-            try:
-                # Load summarization model
-                self.summarizer_model = None
-                self.summarizer_tokenizer = None
-                self.qa_model = None
-                self.qa_tokenizer = None
-                
-                # We'll load models only when needed to save memory
-                self.models_loaded = False
-            except Exception as e:
-                st.error(f"Error initializing models: {str(e)}")
-        
+        # Models are held by the module-level `@st.cache_resource` loaders, so
+        # they are shared across every session instead of being rebuilt per tab.
         self.pdf_text = ""
         self.summary = ""
-    
+
     def _load_models(self):
-        """Load AI models when needed"""
-        if not self.models_loaded:
-            try:
-                # Load smaller, faster models for Streamlit compatibility
-                with st.spinner("Loading AI models (first use)..."):
-                    # For summarization - use T5-small instead of BART (more compatible)
-                    self.summarizer_tokenizer = AutoTokenizer.from_pretrained("t5-small")
-                    self.summarizer_model = AutoModelForSeq2SeqLM.from_pretrained("t5-small")
-                    
-                    # For QA - use a smaller model
-                    self.qa_tokenizer = AutoTokenizer.from_pretrained("distilbert-base-cased-distilled-squad")
-                    self.qa_model = AutoModelForQuestionAnswering.from_pretrained("distilbert-base-cased-distilled-squad")
-                
-                self.models_loaded = True
-            except Exception as e:
-                st.error(f"Error loading models: {str(e)}")
-                return False
-        return True
-        
+        """Warm the shared model cache. Returns False if loading failed."""
+        try:
+            self.summarizer_tokenizer, self.summarizer_model = load_summarizer()
+            self.qa_tokenizer, self.qa_model = load_qa()
+            return True
+        except Exception as e:
+            st.error(f"Error loading models: {str(e)}")
+            return False
+
     def read_pdf(self, pdf_file):
-        """Extract text from a PDF file using pdfplumber."""
+        """Extract text from a PDF file."""
         try:
             pdf_bytes = pdf_file.read()
             pdf_file.seek(0)  # Reset file pointer after reading
-            
-            self.pdf_text = ""
-            
-            # Use pdfplumber to read the PDF
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                total_pages = len(pdf.pages)
-                progress_bar = st.progress(0)
-                
-                for page_num, page in enumerate(pdf.pages):
-                    page_text = page.extract_text() or ""
-                    self.pdf_text += page_text + "\n"
-                    progress_bar.progress((page_num + 1) / total_pages)
-            
-            return f"PDF loaded successfully. Contains {len(self.pdf_text)} characters and {total_pages} pages."
+
+            progress_bar = st.progress(0)
+            result = extract_pdf_cached(pdf_bytes, throttled_progress(progress_bar))
+            progress_bar.empty()
+
+            self.pdf_text = result.text
+
+            if not self.pdf_text.strip():
+                return (
+                    "No text could be extracted. The document may be a scan or "
+                    "images only, which needs OCR rather than text extraction."
+                )
+
+            return (
+                f"PDF loaded successfully. Contains {result.char_count} characters "
+                f"and {result.page_count} pages (read with {result.backend})."
+            )
         except Exception as e:
             return f"Error reading PDF: {str(e)}"
     
@@ -176,11 +223,13 @@ class PDFAssistant:
         if not self._load_models():
             return "Failed to load AI models.", 0
 
+        import torch
+
         # Tokenize the input
-        inputs = self.qa_tokenizer(question, context, return_tensors="pt", 
+        inputs = self.qa_tokenizer(question, context, return_tensors="pt",
                                   truncation=True, max_length=512,
                                   padding="max_length")
-        
+
         # Get the answer
         with torch.no_grad():
             outputs = self.qa_model(**inputs)
@@ -205,9 +254,6 @@ class PDFAssistant:
             return "Please enter a valid question."
         
         try:
-            # Add torch import here to avoid issues with module not available at top level
-            import torch
-            
             # For long documents, find the most relevant sections
             chunks = self._split_text(self.pdf_text, max_length=1000, overlap=100)
             
@@ -265,6 +311,9 @@ class PDFAssistant:
             
         # First split by sentences to avoid cutting in the middle of a sentence
         try:
+            ensure_sentence_tokenizer()
+            from nltk.tokenize import sent_tokenize
+
             sentences = sent_tokenize(text)
         except Exception as e:
             st.error(f"Error tokenizing text: {str(e)}")
@@ -391,15 +440,16 @@ def main():
         - T5 for summarization
         - DistilBERT for question answering
         - NLTK for text processing
-        - pdfplumber for PDF extraction
+        - pypdfium2 for PDF extraction, with pdfplumber as a fallback
         """)
-        
+
         st.divider()
         st.markdown("""
         **Performance Tips:**
         - Smaller PDFs work faster
         - Technical documents work better than scanned or image-heavy PDFs
-        - Models are loaded only when needed to improve performance
+        - Models load once per server and are shared by every session
+        - Re-processing the same file is served from cache
         """)
     
     # Main content area - tabs for Summary and Q&A

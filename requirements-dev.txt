@@ -1,0 +1,5 @@
+# Development and benchmarking extras, on top of requirements.txt.
+-r requirements.txt
+
+# Generates the benchmark fixture PDFs.
+reportlab==5.0.0
