@@ -12,6 +12,7 @@ st.set_page_config(
 
 import inference
 import pdf_extract
+import retrieval
 
 SUMMARIZER_MODEL = inference.SUMMARIZER_MODEL
 QA_MODEL = inference.QA_MODEL
@@ -64,6 +65,22 @@ def load_qa():
 
     model = AutoModelForQuestionAnswering.from_pretrained(QA_MODEL)
     return AutoTokenizer.from_pretrained(QA_MODEL), inference.prepare(model)
+
+
+@st.cache_resource(show_spinner=False)
+def load_embedder():
+    """Load the static embedding model once per process.
+
+    Returns None when it is unavailable, in which case retrieval runs on BM25
+    alone rather than the app failing.
+    """
+    return retrieval.load_embedder()
+
+
+@st.cache_resource(show_spinner="Indexing the document...", max_entries=4)
+def build_index(chunks):
+    """Index a document's chunks once, then reuse it for every question."""
+    return retrieval.ChunkIndex.build(chunks, load_embedder())
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -170,33 +187,41 @@ class PDFAssistant:
             if not chunks:
                 return "Unable to extract meaningful text from the PDF."
 
+            # Cap the map phase so cost and output length stop tracking document
+            # length. Selection spreads across topics rather than truncating.
+            index = build_index(chunks)
+            selected = retrieval.select_representative(
+                chunks, inference.SUMMARY_MAX_MAP_CHUNKS, index
+            )
+            sampled = [chunks[i] for i in selected]
+
             progress_bar = st.progress(0)
             status_text = st.empty()
             budget = inference.Budget(SUMMARY_TIME_BUDGET)
 
-            summaries = inference.summarize_chunks(
-                chunks,
+            summary = inference.summarize_document(
+                sampled,
                 self.summarizer_tokenizer,
                 self.summarizer_model,
                 budget=budget,
                 progress=throttled_progress(
-                    progress_bar, status=status_text, label="Summarising chunk"
+                    progress_bar, status=status_text, label="Summarising section"
                 ),
             )
 
             progress_bar.empty()
             status_text.empty()
 
-            if not summaries:
+            if not summary:
                 return "Could not generate a summary. Try a different document or check document quality."
 
-            if len(summaries) < len(chunks):
-                st.warning(
-                    f"Summarised {len(summaries)} of {len(chunks)} sections before "
-                    f"the {SUMMARY_TIME_BUDGET}s budget ran out."
+            if len(sampled) < len(chunks):
+                st.caption(
+                    f"Summarised {len(sampled)} representative sections of "
+                    f"{len(chunks)}, then condensed them into one summary."
                 )
 
-            self.summary = " ".join(summaries)
+            self.summary = summary
 
             return self.summary
         except Exception as e:
@@ -220,18 +245,25 @@ class PDFAssistant:
             if not chunks:
                 return "Unable to extract meaningful text from the PDF to answer questions."
 
+            # Retrieve first: the QA model only reads the handful of chunks
+            # worth reading, instead of every chunk in the document.
+            index = build_index(chunks)
+            candidates = index.search(question, k=retrieval.TOP_K)
+            if not candidates:
+                return "I couldn't find an answer to that question in the document."
+
             progress_bar = st.progress(0)
             status_text = st.empty()
             budget = inference.Budget(QA_TIME_BUDGET)
 
             best = inference.answer_from_chunks(
                 question,
-                chunks,
+                [chunks[i] for i in candidates],
                 self.qa_tokenizer,
                 self.qa_model,
                 budget=budget,
                 progress=throttled_progress(
-                    progress_bar, status=status_text, label="Searching section"
+                    progress_bar, status=status_text, label="Reading section"
                 ),
             )
 

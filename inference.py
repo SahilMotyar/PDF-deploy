@@ -41,6 +41,15 @@ MAX_ANSWER_TOKENS = 40
 SUMMARY_MAX_NEW_TOKENS = 100
 SUMMARY_MIN_NEW_TOKENS = 30
 
+# Ceiling on chunks summarised in the map phase. Without this the cost of a
+# summary grows linearly with the document forever, and the output -- every
+# chunk summary concatenated -- grows with it, which is how a 20k-character
+# document produced 14k characters of "summary".
+SUMMARY_MAX_MAP_CHUNKS = 24
+
+# The reduce phase re-summarises its own output until it fits one window.
+MAX_REDUCE_ROUNDS = 3
+
 # Beam search multiplies decode cost by the beam count. Four beams was the
 # original setting; two keeps most of the quality for half the work.
 SUMMARY_NUM_BEAMS = 2
@@ -254,6 +263,69 @@ def summarize_chunks(
         _emit(progress, min(start + len(batch), total), total)
 
     return summaries
+
+
+def reduce_summaries(
+    summaries: Sequence[str],
+    tokenizer,
+    model,
+    batch_size: int = 4,
+    budget: Budget | None = None,
+) -> str:
+    """Fold many chunk summaries into one readable summary.
+
+    Concatenating every chunk summary, as the original did, produces something
+    as long as the document and about as hard to read. This re-summarises the
+    concatenation until it fits a single model window.
+    """
+    if not summaries:
+        return ""
+    if len(summaries) == 1:
+        return summaries[0]
+
+    text = " ".join(summaries)
+
+    for _ in range(MAX_REDUCE_ROUNDS):
+        if budget is not None and budget.expired:
+            break
+
+        pieces = chunk_by_tokens(text, tokenizer, SUMMARY_INPUT_TOKENS, overlap_tokens=0)
+        if len(pieces) <= 1:
+            # Fits in one pass: a final round makes it read as one summary
+            # rather than as concatenated fragments.
+            final = summarize_chunks(
+                pieces, tokenizer, model, batch_size=batch_size, budget=budget
+            )
+            return final[0] if final else text
+
+        folded = summarize_chunks(
+            pieces, tokenizer, model, batch_size=batch_size, budget=budget
+        )
+        if not folded:
+            break
+
+        joined = " ".join(folded)
+        # If a round stops shrinking the text, further rounds will not help.
+        if len(joined) >= len(text):
+            return joined
+        text = joined
+
+    return text
+
+
+def summarize_document(
+    chunks: Sequence[str],
+    tokenizer,
+    model,
+    batch_size: int = 4,
+    budget: Budget | None = None,
+    progress: ProgressFn | None = None,
+) -> str:
+    """Map-reduce summarisation over an already-bounded set of chunks."""
+    partials = summarize_chunks(
+        chunks, tokenizer, model, batch_size=batch_size, budget=budget, progress=progress
+    )
+    return reduce_summaries(partials, tokenizer, model, batch_size=batch_size, budget=budget)
 
 
 # --- Extractive QA -----------------------------------------------------------
