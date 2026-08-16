@@ -67,20 +67,10 @@ def load_qa():
     return AutoTokenizer.from_pretrained(QA_MODEL), inference.prepare(model)
 
 
-@st.cache_resource(show_spinner=False)
-def load_embedder():
-    """Load the static embedding model once per process.
-
-    Returns None when it is unavailable, in which case retrieval runs on BM25
-    alone rather than the app failing.
-    """
-    return retrieval.load_embedder()
-
-
-@st.cache_resource(show_spinner="Indexing the document...", max_entries=4)
+@st.cache_resource(show_spinner=False, max_entries=4)
 def build_index(chunks):
     """Index a document's chunks once, then reuse it for every question."""
-    return retrieval.ChunkIndex.build(chunks, load_embedder())
+    return retrieval.ChunkIndex.build(chunks)
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -188,10 +178,9 @@ class PDFAssistant:
                 return "Unable to extract meaningful text from the PDF."
 
             # Cap the map phase so cost and output length stop tracking document
-            # length. Selection spreads across topics rather than truncating.
-            index = build_index(chunks)
+            # length. Sampling across the document beats truncating it.
             selected = retrieval.select_representative(
-                chunks, inference.SUMMARY_MAX_MAP_CHUNKS, index
+                chunks, inference.SUMMARY_MAX_MAP_CHUNKS
             )
             sampled = [chunks[i] for i in selected]
 
@@ -378,6 +367,7 @@ def main():
         - Hugging Face Transformers
         - T5 for summarization
         - DistilBERT for question answering
+        - BM25 retrieval to find the relevant sections
         - NLTK for text processing
         - pypdfium2 for PDF extraction, with pdfplumber as a fallback
         """)
@@ -391,6 +381,8 @@ def main():
         - Re-processing the same file is served from cache
         - Chunks are batched through the models, and sized to fill the
           512-token window rather than a quarter of it
+        - Questions are answered from the sections retrieval ranks highest,
+          so cost does not grow with the length of the document
         """)
     
     # Main content area - tabs for Summary and Q&A

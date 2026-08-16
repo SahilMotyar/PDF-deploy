@@ -47,7 +47,11 @@ SUMMARY_MIN_NEW_TOKENS = 30
 # document produced 14k characters of "summary".
 SUMMARY_MAX_MAP_CHUNKS = 24
 
-# The reduce phase re-summarises its own output until it fits one window.
+# The reduce phase folds its own output until the summary is about this long.
+# Folding all the way down to a single pass gives one ~280-character blurb for
+# a 120,000-character document, which is too terse to be useful; a few hundred
+# words is the readable range. This is a floor to stop at, not a hard cap.
+SUMMARY_TARGET_CHARS = 2000
 MAX_REDUCE_ROUNDS = 3
 
 # Beam search multiplies decode cost by the beam count. Four beams was the
@@ -276,7 +280,7 @@ def reduce_summaries(
 
     Concatenating every chunk summary, as the original did, produces something
     as long as the document and about as hard to read. This re-summarises the
-    concatenation until it fits a single model window.
+    concatenation until it is down to roughly SUMMARY_TARGET_CHARS.
     """
     if not summaries:
         return ""
@@ -286,13 +290,15 @@ def reduce_summaries(
     text = " ".join(summaries)
 
     for _ in range(MAX_REDUCE_ROUNDS):
+        if len(text) <= SUMMARY_TARGET_CHARS:
+            break
         if budget is not None and budget.expired:
             break
 
         pieces = chunk_by_tokens(text, tokenizer, SUMMARY_INPUT_TOKENS, overlap_tokens=0)
         if len(pieces) <= 1:
-            # Fits in one pass: a final round makes it read as one summary
-            # rather than as concatenated fragments.
+            # Already inside one window but still over target: a single pass
+            # makes it read as one summary rather than joined fragments.
             final = summarize_chunks(
                 pieces, tokenizer, model, batch_size=batch_size, budget=budget
             )

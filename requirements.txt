@@ -18,10 +18,6 @@ pdfplumber==0.11.10
 nltk==3.10.3
 torch==2.13.0+cpu
 transformers==5.15.0
-numpy==2.5.2
 
-# Static embeddings for chunk retrieval: token lookups plus pooling rather than
-# a transformer forward pass, so indexing a document costs milliseconds. Q&A
-# degrades to BM25-only retrieval if this is unavailable, so it is not load
-# bearing -- but without it, paraphrased questions retrieve noticeably worse.
-model2vec==0.9.0
+# Chunk retrieval is BM25 in pure Python (retrieval.py) -- no dependency, no
+# model download. Static embeddings were benchmarked against it and lost.
