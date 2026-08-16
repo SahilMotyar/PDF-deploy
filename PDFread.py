@@ -1,5 +1,6 @@
+import base64
+
 import streamlit as st
-import torch
 
 # Set page config at the very top, before any other Streamlit commands
 st.set_page_config(
@@ -9,286 +10,262 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Simplified imports - avoid incompatible libraries
-import pdfplumber
-import io
-import time
-import base64
-import nltk
-from threading import Timer
+import inference
+import pdf_extract
+import retrieval
 
-# Use a simplified approach to avoid transformers pipeline issues
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoModelForQuestionAnswering
+SUMMARIZER_MODEL = inference.SUMMARIZER_MODEL
+QA_MODEL = inference.QA_MODEL
 
-# Download NLTK punkt package
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
-from nltk.tokenize import sent_tokenize
+# Wall-clock budgets, checked between batches.
+SUMMARY_TIME_BUDGET = 300
+QA_TIME_BUDGET = 90
 
-class TimeoutException(Exception):
-    pass
+# torch and transformers are imported inside the loaders below rather than at
+# module scope. They cost seconds to import, and Streamlit's file watcher is
+# known to trip over torch's custom class registry when it is imported eagerly.
 
-def timeout_handler():
-    raise TimeoutException("Operation timed out")
+
+@st.cache_resource(show_spinner=False)
+def ensure_sentence_tokenizer():
+    """Fetch the NLTK sentence tokenizer once per process, not once per rerun."""
+    import nltk
+
+    # NLTK 3.9 replaced the `punkt` data package with `punkt_tab`. Accept
+    # either so the app works across versions.
+    for package in ("punkt_tab", "punkt"):
+        try:
+            nltk.data.find(f"tokenizers/{package}")
+            return True
+        except LookupError:
+            continue
+
+    for package in ("punkt_tab", "punkt"):
+        try:
+            if nltk.download(package, quiet=True):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+@st.cache_resource(show_spinner="Loading the summarisation model...")
+def load_summarizer():
+    """Load T5 once per process and share it across every session."""
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(SUMMARIZER_MODEL)
+    return AutoTokenizer.from_pretrained(SUMMARIZER_MODEL), inference.prepare(model)
+
+
+@st.cache_resource(show_spinner="Loading the question-answering model...")
+def load_qa():
+    """Load DistilBERT once per process and share it across every session."""
+    from transformers import AutoModelForQuestionAnswering, AutoTokenizer
+
+    model = AutoModelForQuestionAnswering.from_pretrained(QA_MODEL)
+    return AutoTokenizer.from_pretrained(QA_MODEL), inference.prepare(model)
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def build_index(chunks):
+    """Index a document's chunks once, then reuse it for every question."""
+    return retrieval.ChunkIndex.build(chunks)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def extract_pdf_cached(pdf_bytes, _progress=None):
+    """Extract text from a PDF, keyed on the file's content.
+
+    Re-uploading or re-processing the same document is served from cache.
+    `_progress` is underscore-prefixed so Streamlit excludes it from the key.
+    """
+    return pdf_extract.extract(pdf_bytes, _progress)
+
+
+def throttled_progress(bar, step=0.02, status=None, label=""):
+    """Return a progress callback that only redraws every `step` of the way.
+
+    Each `st.progress` call is a websocket round-trip, so updating on every
+    page or chunk costs more than the work being reported on.
+    """
+    last = {"fraction": -1.0}
+
+    def report(done, total):
+        fraction = done / total if total else 1.0
+        if fraction - last["fraction"] >= step or done >= total:
+            last["fraction"] = fraction
+            bar.progress(min(1.0, fraction))
+            if status is not None:
+                status.text(f"{label} {done}/{total}...")
+
+    return report
+
 
 class PDFAssistant:
     def __init__(self):
-        # Initialize models - using a more compatibility-focused approach
-        with st.spinner("Loading AI models..."):
-            try:
-                # Load summarization model
-                self.summarizer_model = None
-                self.summarizer_tokenizer = None
-                self.qa_model = None
-                self.qa_tokenizer = None
-                
-                # We'll load models only when needed to save memory
-                self.models_loaded = False
-            except Exception as e:
-                st.error(f"Error initializing models: {str(e)}")
-        
+        # Models are held by the module-level `@st.cache_resource` loaders, so
+        # they are shared across every session instead of being rebuilt per tab.
         self.pdf_text = ""
         self.summary = ""
-    
+        # Chunking is not free, and every question re-chunks the same document,
+        # so results are memoised until a new PDF is loaded.
+        self._chunk_cache = {}
+
     def _load_models(self):
-        """Load AI models when needed"""
-        if not self.models_loaded:
-            try:
-                # Load smaller, faster models for Streamlit compatibility
-                with st.spinner("Loading AI models (first use)..."):
-                    # For summarization - use T5-small instead of BART (more compatible)
-                    self.summarizer_tokenizer = AutoTokenizer.from_pretrained("t5-small")
-                    self.summarizer_model = AutoModelForSeq2SeqLM.from_pretrained("t5-small")
-                    
-                    # For QA - use a smaller model
-                    self.qa_tokenizer = AutoTokenizer.from_pretrained("distilbert-base-cased-distilled-squad")
-                    self.qa_model = AutoModelForQuestionAnswering.from_pretrained("distilbert-base-cased-distilled-squad")
-                
-                self.models_loaded = True
-            except Exception as e:
-                st.error(f"Error loading models: {str(e)}")
-                return False
-        return True
-        
+        """Warm the shared model cache. Returns False if loading failed."""
+        try:
+            self.summarizer_tokenizer, self.summarizer_model = load_summarizer()
+            self.qa_tokenizer, self.qa_model = load_qa()
+            return True
+        except Exception as e:
+            st.error(f"Error loading models: {str(e)}")
+            return False
+
     def read_pdf(self, pdf_file):
-        """Extract text from a PDF file using pdfplumber."""
+        """Extract text from a PDF file."""
         try:
             pdf_bytes = pdf_file.read()
             pdf_file.seek(0)  # Reset file pointer after reading
-            
-            self.pdf_text = ""
-            
-            # Use pdfplumber to read the PDF
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                total_pages = len(pdf.pages)
-                progress_bar = st.progress(0)
-                
-                for page_num, page in enumerate(pdf.pages):
-                    page_text = page.extract_text() or ""
-                    self.pdf_text += page_text + "\n"
-                    progress_bar.progress((page_num + 1) / total_pages)
-            
-            return f"PDF loaded successfully. Contains {len(self.pdf_text)} characters and {total_pages} pages."
+
+            progress_bar = st.progress(0)
+            result = extract_pdf_cached(pdf_bytes, throttled_progress(progress_bar))
+            progress_bar.empty()
+
+            self.pdf_text = result.text
+            self._chunk_cache.clear()
+
+            if not self.pdf_text.strip():
+                return (
+                    "No text could be extracted. The document may be a scan or "
+                    "images only, which needs OCR rather than text extraction."
+                )
+
+            return (
+                f"PDF loaded successfully. Contains {result.char_count} characters "
+                f"and {result.page_count} pages (read with {result.backend})."
+            )
         except Exception as e:
             return f"Error reading PDF: {str(e)}"
     
-    def _summarize_text(self, text):
-        """Summarize a chunk of text using the model."""
-        if not self._load_models():
-            return "Failed to load AI models."
-            
-        # Prepare the input for T5 (expects "summarize: " prefix)
-        inputs = self.summarizer_tokenizer("summarize: " + text, return_tensors="pt", max_length=512, truncation=True)
-        
-        # Generate summary
-        summary_ids = self.summarizer_model.generate(
-            inputs.input_ids, 
-            max_length=100, 
-            min_length=30,
-            length_penalty=2.0,
-            num_beams=4,
-            early_stopping=True
-        )
-        
-        # Decode the summary
-        summary = self.summarizer_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-        return summary
-    
+    def _chunks(self, kind, tokenizer, budget_tokens):
+        """Token-aware chunks for `kind`, memoised for the loaded document."""
+        if kind not in self._chunk_cache:
+            ensure_sentence_tokenizer()
+            self._chunk_cache[kind] = inference.chunk_by_tokens(
+                self.pdf_text, tokenizer, budget_tokens
+            )
+        return self._chunk_cache[kind]
+
     def generate_summary(self):
         """Generate a summary of the PDF content."""
         if not self.pdf_text:
             return "Please load a PDF first."
-        
+
+        if not self._load_models():
+            return "Failed to load AI models."
+
         try:
-            # Break the text into manageable chunks
-            chunks = self._split_text(self.pdf_text, max_length=500, overlap=50)
-            
+            chunks = [
+                chunk
+                for chunk in self._chunks(
+                    "summary", self.summarizer_tokenizer, inference.SUMMARY_INPUT_TOKENS
+                )
+                if len(chunk) >= 100  # skip fragments too short to summarise
+            ]
+
             if not chunks:
                 return "Unable to extract meaningful text from the PDF."
-            
-            summaries = []
+
+            # Cap the map phase so cost and output length stop tracking document
+            # length. Sampling across the document beats truncating it.
+            selected = retrieval.select_representative(
+                chunks, inference.SUMMARY_MAX_MAP_CHUNKS
+            )
+            sampled = [chunks[i] for i in selected]
+
             progress_bar = st.progress(0)
             status_text = st.empty()
-            
-            for i, chunk in enumerate(chunks):
-                progress_value = (i + 1) / len(chunks)
-                progress_bar.progress(progress_value)
-                status_text.text(f"Processing chunk {i+1}/{len(chunks)}...")
-                
-                if len(chunk) < 100:  # Skip very short chunks
-                    continue
-                    
-                # Generate summary for this chunk with timeout
-                try:
-                    timeout_flag = False
-                    timer = Timer(60, timeout_handler)  # 60 second timeout
-                    timer.start()
-                    try:
-                        chunk_summary = self._summarize_text(chunk)
-                        summaries.append(chunk_summary)
-                    except TimeoutException:
-                        timeout_flag = True
-                        st.warning(f"Chunk {i+1} took too long to summarize. Skipping.")
-                    finally:
-                        timer.cancel()
-                    
-                    if timeout_flag:
-                        continue
-                        
-                except Exception as e:
-                    st.error(f"Error summarizing chunk {i+1}: {str(e)}")
-            
-            # Combine the summaries
-            if not summaries:
+            budget = inference.Budget(SUMMARY_TIME_BUDGET)
+
+            summary = inference.summarize_document(
+                sampled,
+                self.summarizer_tokenizer,
+                self.summarizer_model,
+                budget=budget,
+                progress=throttled_progress(
+                    progress_bar, status=status_text, label="Summarising section"
+                ),
+            )
+
+            progress_bar.empty()
+            status_text.empty()
+
+            if not summary:
                 return "Could not generate a summary. Try a different document or check document quality."
-                
-            self.summary = " ".join(summaries)
-            
+
+            if len(sampled) < len(chunks):
+                st.caption(
+                    f"Summarised {len(sampled)} representative sections of "
+                    f"{len(chunks)}, then condensed them into one summary."
+                )
+
+            self.summary = summary
+
             return self.summary
         except Exception as e:
             st.error(f"Error in summary generation: {str(e)}")
             return "An error occurred while generating the summary."
-    
-    def _answer_question_from_context(self, question, context):
-        """Answer a question based on the given context."""
-        if not self._load_models():
-            return "Failed to load AI models.", 0
 
-        # Tokenize the input
-        inputs = self.qa_tokenizer(question, context, return_tensors="pt", 
-                                  truncation=True, max_length=512,
-                                  padding="max_length")
-        
-        # Get the answer
-        with torch.no_grad():
-            outputs = self.qa_model(**inputs)
-            answer_start = torch.argmax(outputs.start_logits)
-            answer_end = torch.argmax(outputs.end_logits) + 1
-            answer = self.qa_tokenizer.convert_tokens_to_string(
-                self.qa_tokenizer.convert_ids_to_tokens(inputs.input_ids[0][answer_start:answer_end])
-            )
-        
-        # Calculate confidence score (simplified)
-        confidence = float(torch.max(outputs.start_logits).item() + torch.max(outputs.end_logits).item()) / 2
-        normalized_conf = min(1.0, max(0.0, confidence / 10.0))  # Normalize to 0-1
-        
-        return answer, normalized_conf
-    
     def answer_question(self, question):
         """Answer a question based on the PDF content."""
         if not self.pdf_text:
             return "Please load a PDF first."
-        
+
         if not question.strip():
             return "Please enter a valid question."
-        
+
+        if not self._load_models():
+            return "Failed to load AI models."
+
         try:
-            # Add torch import here to avoid issues with module not available at top level
-            import torch
-            
-            # For long documents, find the most relevant sections
-            chunks = self._split_text(self.pdf_text, max_length=1000, overlap=100)
-            
+            chunks = self._chunks("qa", self.qa_tokenizer, inference.QA_INPUT_TOKENS)
+
             if not chunks:
                 return "Unable to extract meaningful text from the PDF to answer questions."
-            
-            best_answer = ""
-            highest_score = 0
-            
+
+            # Retrieve first: the QA model only reads the handful of chunks
+            # worth reading, instead of every chunk in the document.
+            index = build_index(chunks)
+            candidates = index.search(question, k=retrieval.TOP_K)
+            if not candidates:
+                return "I couldn't find an answer to that question in the document."
+
             progress_bar = st.progress(0)
             status_text = st.empty()
-            
-            for i, chunk in enumerate(chunks):
-                progress_value = (i + 1) / len(chunks)
-                progress_bar.progress(progress_value)
-                status_text.text(f"Searching chunk {i+1}/{len(chunks)}...")
-                
-                try:
-                    timeout_flag = False
-                    timer = Timer(30, timeout_handler)  # 30 second timeout per chunk
-                    timer.start()
-                    try:
-                        answer, score = self._answer_question_from_context(question, chunk)
-                        
-                        if score > highest_score and len(answer.strip()) > 0:
-                            highest_score = score
-                            best_answer = answer
-                    except TimeoutException:
-                        timeout_flag = True
-                        st.warning(f"Chunk {i+1} took too long to process. Skipping.")
-                    finally:
-                        timer.cancel()
-                    
-                    if timeout_flag:
-                        continue
-                        
-                except Exception as e:
-                    st.error(f"Error processing chunk {i+1}: {str(e)}")
-            
+            budget = inference.Budget(QA_TIME_BUDGET)
+
+            best = inference.answer_from_chunks(
+                question,
+                [chunks[i] for i in candidates],
+                self.qa_tokenizer,
+                self.qa_model,
+                budget=budget,
+                progress=throttled_progress(
+                    progress_bar, status=status_text, label="Reading section"
+                ),
+            )
+
             progress_bar.empty()
             status_text.empty()
-            
-            if not best_answer:
+
+            if best is None or not best.text:
                 return "I couldn't find an answer to that question in the document."
-                
-            return f"{best_answer} (Confidence: {highest_score:.2f})"
+
+            return f"{best.text} (Confidence: {best.score:.2f})"
         except Exception as e:
             st.error(f"Error in question answering: {str(e)}")
             return "An error occurred while processing your question."
-    
-    def _split_text(self, text, max_length=1000, overlap=100):
-        """Split text into overlapping chunks of approximately max_length characters."""
-        if not text or text.isspace():
-            return []
-            
-        # First split by sentences to avoid cutting in the middle of a sentence
-        try:
-            sentences = sent_tokenize(text)
-        except Exception as e:
-            st.error(f"Error tokenizing text: {str(e)}")
-            # Fallback to simple splitting if tokenization fails
-            sentences = [s + "." for s in text.split(".") if s]
-        
-        chunks = []
-        current_chunk = ""
-        
-        for sentence in sentences:
-            if len(current_chunk) + len(sentence) <= max_length:
-                current_chunk += " " + sentence
-            else:
-                if current_chunk.strip():  # Only add non-empty chunks
-                    chunks.append(current_chunk.strip())
-                # Start a new chunk with overlap from the previous chunk
-                overlap_point = max(0, len(current_chunk) - overlap)
-                current_chunk = current_chunk[overlap_point:] + " " + sentence
-        
-        # Add the last chunk if it's not empty
-        if current_chunk.strip():
-            chunks.append(current_chunk.strip())
-            
-        return chunks
 
 
 # Function to create a download link for text
@@ -390,16 +367,22 @@ def main():
         - Hugging Face Transformers
         - T5 for summarization
         - DistilBERT for question answering
+        - BM25 retrieval to find the relevant sections
         - NLTK for text processing
-        - pdfplumber for PDF extraction
+        - pypdfium2 for PDF extraction, with pdfplumber as a fallback
         """)
-        
+
         st.divider()
         st.markdown("""
         **Performance Tips:**
         - Smaller PDFs work faster
         - Technical documents work better than scanned or image-heavy PDFs
-        - Models are loaded only when needed to improve performance
+        - Models load once per server and are shared by every session
+        - Re-processing the same file is served from cache
+        - Chunks are batched through the models, and sized to fill the
+          512-token window rather than a quarter of it
+        - Questions are answered from the sections retrieval ranks highest,
+          so cost does not grow with the length of the document
         """)
     
     # Main content area - tabs for Summary and Q&A

@@ -79,13 +79,22 @@ No model behaviour changes, so it is safe to land first and easy to verify.
 
 ### Stage 3 — Algorithmic: retrieval instead of brute force
 
-- Embed chunks **once** per document and cache the matrix.
+- Index chunks **once** per document and cache the index.
 - Answer questions by retrieving the top-k chunks and running the QA model on
   those only — turning an O(N) scan into O(k).
 - Map-reduce summarisation with a bounded budget and a second-pass reduction, so
   the summary stays readable and the cost stops growing linearly.
 
 **Fixes:** 1, 6.
+
+Landed with one deviation from the plan. Static embeddings were implemented and
+benchmarked, then removed: BM25 alone scored 100% recall@5 against their 90%,
+and the hybrid of the two was worse than BM25 on its own. Retrieval is
+therefore pure-Python BM25 with no model and no extra dependency. Selecting
+which chunks to summarise went the same way — evenly spaced sampling matched
+k-means and beat max-marginal-relevance, so the embedding-based variants were
+dropped. Numbers and the caveat on how they were measured are in
+`benchmarks/README.md`.
 
 ### Stage 4 — UX and deployment
 
