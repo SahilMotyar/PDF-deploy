@@ -80,11 +80,14 @@ class Budget:
 
     def __init__(self, seconds: float | None):
         self.seconds = seconds
-        self._start = time.monotonic()
+        # perf_counter rather than monotonic: both are monotonic, but
+        # monotonic's resolution on Windows is ~15.6ms, coarse enough that
+        # short intervals measure as exactly zero.
+        self._start = time.perf_counter()
 
     @property
     def elapsed(self) -> float:
-        return time.monotonic() - self._start
+        return time.perf_counter() - self._start
 
     @property
     def expired(self) -> bool:

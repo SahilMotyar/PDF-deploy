@@ -46,24 +46,25 @@ class TestChunkByTokens:
         assert "word0" in chunks[0]
         assert "word499" in chunks[-1]
 
+    # Every word below is unique to its sentence. Shared filler would make
+    # these assertions pass on repeated vocabulary rather than real overlap.
+    UNIQUE = " ".join(f"Alpha{i} Beta{i} Gamma{i} Delta{i}." for i in range(60))
+
     def test_overlap_carries_context_between_chunks(self, tokenizer):
-        text = " ".join(f"Alpha{i} beta gamma delta epsilon." for i in range(60))
         chunks = inference.chunk_by_tokens(
-            text, tokenizer, budget_tokens=40, overlap_tokens=10
+            self.UNIQUE, tokenizer, budget_tokens=40, overlap_tokens=12
         )
         assert len(chunks) > 2
         # The tail of one chunk should reappear at the head of the next.
-        first_tail = set(chunks[0].split()[-10:])
-        second_head = set(chunks[1].split()[:10])
-        assert first_tail & second_head
+        assert set(chunks[0].split()) & set(chunks[1].split())
 
     def test_zero_overlap_produces_no_repetition(self, tokenizer):
-        text = " ".join(f"Alpha{i} beta gamma." for i in range(60))
         chunks = inference.chunk_by_tokens(
-            text, tokenizer, budget_tokens=30, overlap_tokens=0
+            self.UNIQUE, tokenizer, budget_tokens=30, overlap_tokens=0
         )
         assert len(chunks) > 2
-        assert not set(chunks[0].split()[-5:]) & set(chunks[1].split()[:5])
+        for earlier, later in zip(chunks, chunks[1:]):
+            assert not set(earlier.split()) & set(later.split())
 
 
 class TestBudget:

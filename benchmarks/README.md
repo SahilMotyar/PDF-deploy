@@ -176,3 +176,39 @@ down. Folding to a single pass gave one 284-character blurb for a 121,000
 statements to invented names. That is the model, not the pipeline, and no
 amount of chunking fixes it. Choosing a stronger summarisation model is a
 separate change from making the existing one fast.
+
+## Tests and streaming (Stage 4)
+
+`pytest -q` runs 36 tests in about 0.6 seconds. The suite installs from
+`requirements-dev.txt`, which deliberately omits torch and transformers: a
+stubbed word-per-token tokenizer stands in for the real one, so chunking,
+retrieval, the time budget and the reduce loop are all covered without
+downloading a model. CI runs it on Python 3.11, 3.12 and 3.13.
+
+What the suite does **not** cover, because it needs torch: span decoding and
+batched generation. Those are measured by `bench_inference.py` and
+`bench_retrieval.py` instead, which is why those scripts reproduce the original
+implementations inline rather than only timing the new ones.
+
+CI also fails the build if any requirements file is not valid UTF-8, since
+`requirements.txt` shipped as UTF-16LE once already.
+
+Two bugs surfaced from writing the tests rather than from review:
+
+* `Budget.elapsed` used `time.monotonic()`, whose resolution on Windows is
+  ~15.6ms -- coarse enough that a 10ms interval measured as exactly zero. Now
+  `time.perf_counter()`, which is equally monotonic and far finer.
+* Two of the chunking tests passed for the wrong reason: their filler words
+  repeated across every sentence, so the overlap assertions matched shared
+  vocabulary rather than actual overlap. The fixtures now use vocabulary unique
+  to each sentence.
+
+### Streaming
+
+Section summaries are handed to the UI as each batch finishes. On an 8-page
+document with the model cache warm, the first content appears 5.1s into a 15.9s
+run and updates roughly every 3.4s, instead of showing nothing until the end.
+
+Cold start is separate and unchanged: the first request to a fresh server waits
+~18s for the models to load and quantise. `@st.cache_resource` means that is
+paid once per server process, not once per user or per question.

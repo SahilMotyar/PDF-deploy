@@ -103,6 +103,16 @@ dropped. Numbers and the caveat on how they were measured are in
 - Stream results as they arrive rather than blocking behind a spinner.
 - Regression tests and a CI workflow.
 
+Landed as planned. The Summary and Q&A tabs are now fragments, so asking a
+question re-runs that panel alone instead of the whole script. Section
+summaries stream into the UI as each batch completes. The suite is 36 tests in
+0.6s with no model downloads, and CI additionally guards the requirements files
+against the UTF-16 encoding that broke installs once already.
+
+Conversation history also moved out of the render path: it was appended while
+drawing the page, so what got recorded depended on how often Streamlit reran.
+It is now recorded where an answer is actually produced.
+
 ## Verification
 
 Every stage is measured with `benchmarks/bench_extract.py` against generated
