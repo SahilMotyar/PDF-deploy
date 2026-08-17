@@ -1,5 +1,3 @@
-import base64
-
 import streamlit as st
 
 # Set page config at the very top, before any other Streamlit commands
@@ -157,8 +155,12 @@ class PDFAssistant:
             )
         return self._chunk_cache[kind]
 
-    def generate_summary(self):
-        """Generate a summary of the PDF content."""
+    def generate_summary(self, on_partial=None):
+        """Generate a summary of the PDF content.
+
+        `on_partial` receives section summaries as they are produced, so the
+        caller can show progress with real content during a long run.
+        """
         if not self.pdf_text:
             return "Please load a PDF first."
 
@@ -196,6 +198,7 @@ class PDFAssistant:
                 progress=throttled_progress(
                     progress_bar, status=status_text, label="Summarising section"
                 ),
+                on_partial=on_partial,
             )
 
             progress_bar.empty()
@@ -268,11 +271,108 @@ class PDFAssistant:
             return "An error occurred while processing your question."
 
 
-# Function to create a download link for text
-def get_download_link(text, filename, link_text):
-    b64 = base64.b64encode(text.encode()).decode()
-    href = f'<a href="data:file/txt;base64,{b64}" download="{filename}">{link_text}</a>'
-    return href
+@st.fragment
+def summary_panel():
+    """The Summary tab.
+
+    A fragment, so generating a summary reruns this panel alone instead of the
+    whole script -- no re-rendering the sidebar, the CSS, or the Q&A tab.
+    """
+    st.header("Document Summary")
+
+    if not st.session_state.get("file_processed"):
+        st.info("Please upload and process a PDF file first using the sidebar.")
+        return
+
+    if st.button("Generate Summary"):
+        with st.status("Summarising...", expanded=True) as status:
+            live = st.empty()
+            sections = []
+
+            def on_partial(new_sections):
+                # Show sections as they land rather than a bar with nothing
+                # behind it. The reduce phase rewrites these into the final
+                # summary, so they are labelled as working notes.
+                sections.extend(new_sections)
+                live.markdown(
+                    "\n\n".join(f"- {section}" for section in sections[-4:])
+                )
+
+            summary = st.session_state.assistant.generate_summary(on_partial=on_partial)
+            live.empty()
+            status.update(label="Summary ready", state="complete", expanded=False)
+
+        st.session_state.summary = summary
+
+    if st.session_state.get("summary"):
+        st.markdown("### Summary Output")
+        st.markdown('<div class="summary-container">', unsafe_allow_html=True)
+        st.write(st.session_state.summary)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.download_button(
+            "Download Summary",
+            data=st.session_state.summary,
+            file_name="summary.txt",
+            mime="text/plain",
+        )
+
+
+@st.fragment
+def qa_panel():
+    """The Q&A tab, as a fragment so asking a question does not rerun the page."""
+    st.header("Ask Questions About Your Document")
+
+    if not st.session_state.get("file_processed"):
+        st.info("Please upload and process a PDF file first using the sidebar.")
+        return
+
+    question = st.text_input("Enter your question about the document:")
+
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        ask_button = st.button("Ask")
+    with col2:
+        st.markdown("PDF is loaded and ready for questions")
+
+    if ask_button and question:
+        with st.spinner("Searching for an answer..."):
+            answer = st.session_state.assistant.answer_question(question)
+
+        st.session_state.last_question = question
+        st.session_state.last_answer = answer
+        # Recorded here, where an answer is actually produced. Appending during
+        # rendering meant the history depended on how often the page reran.
+        st.session_state.setdefault("conversation", []).append((question, answer))
+
+    if st.session_state.get("last_answer"):
+        st.markdown("### Question")
+        st.markdown(
+            f'<div class="qa-container"><b style="color: black;">'
+            f'{st.session_state.last_question}</b></div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("### Answer")
+        st.markdown(
+            f'<div class="qa-container"><span style="color: black;">'
+            f'{st.session_state.last_answer}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    history = st.session_state.get("conversation", [])
+    if len(history) > 1:
+        with st.expander("Conversation History"):
+            for i, (q, a) in enumerate(history):
+                st.markdown(
+                    f'<div style="color: black;"><b>Q{i+1}: {q}</b></div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f'<div style="color: black;">A{i+1}: {a}</div>',
+                    unsafe_allow_html=True,
+                )
+                st.divider()
 
 
 def main():
@@ -387,71 +487,12 @@ def main():
     
     # Main content area - tabs for Summary and Q&A
     tab1, tab2 = st.tabs(["📝 Summary", "❓ Question & Answer"])
-    
+
     with tab1:
-        st.header("Document Summary")
-        if 'file_processed' in st.session_state and st.session_state.file_processed:
-            if st.button("Generate Summary"):
-                with st.spinner("Generating summary... This may take a few minutes."):
-                    summary = st.session_state.assistant.generate_summary()
-                    st.session_state.summary = summary
-            
-            if 'summary' in st.session_state and st.session_state.summary:
-                st.markdown("### Summary Output")
-                st.markdown('<div class="summary-container">', unsafe_allow_html=True)
-                st.write(st.session_state.summary)
-                st.markdown('</div>', unsafe_allow_html=True)
-                
-                # Download button for summary
-                st.markdown(
-                    get_download_link(st.session_state.summary, "summary.txt", "Download Summary"),
-                    unsafe_allow_html=True
-                )
-        else:
-            st.info("Please upload and process a PDF file first using the sidebar.")
-    
+        summary_panel()
+
     with tab2:
-        st.header("Ask Questions About Your Document")
-        if 'file_processed' in st.session_state and st.session_state.file_processed:
-            question = st.text_input("Enter your question about the document:")
-            
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                ask_button = st.button("Ask")
-            with col2:
-                if 'file_processed' in st.session_state and st.session_state.file_processed:
-                    st.markdown("PDF is loaded and ready for questions")
-            
-            if ask_button and question:
-                with st.spinner("Searching for an answer..."):
-                    answer = st.session_state.assistant.answer_question(question)
-                    st.session_state.last_answer = answer
-                    st.session_state.last_question = question
-            
-            if 'last_answer' in st.session_state and 'last_question' in st.session_state:
-                st.markdown("### Question")
-                st.markdown(f'<div class="qa-container"><b style="color: black;">{st.session_state.last_question}</b></div>', unsafe_allow_html=True)
-                
-                st.markdown("### Answer")
-                st.markdown(f'<div class="qa-container"><span style="color: black;">{st.session_state.last_answer}</span></div>', unsafe_allow_html=True)
-                
-                # Save conversation
-                if 'conversation' not in st.session_state:
-                    st.session_state.conversation = []
-                
-                # Add to conversation if not already added
-                if not st.session_state.conversation or st.session_state.conversation[-1][0] != st.session_state.last_question:
-                    st.session_state.conversation.append((st.session_state.last_question, st.session_state.last_answer))
-            
-            # Show conversation history
-            if 'conversation' in st.session_state and len(st.session_state.conversation) > 1:
-                with st.expander("Conversation History"):
-                    for i, (q, a) in enumerate(st.session_state.conversation):
-                        st.markdown(f'<div style="color: black;"><b>Q{i+1}: {q}</b></div>', unsafe_allow_html=True)
-                        st.markdown(f'<div style="color: black;">A{i+1}: {a}</div>', unsafe_allow_html=True)
-                        st.divider()
-        else:
-            st.info("Please upload and process a PDF file first using the sidebar.")
+        qa_panel()
 
 
 if __name__ == "__main__":

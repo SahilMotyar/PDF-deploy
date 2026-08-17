@@ -231,8 +231,13 @@ def summarize_chunks(
     num_beams: int = SUMMARY_NUM_BEAMS,
     budget: Budget | None = None,
     progress: ProgressFn | None = None,
+    on_partial: Callable[[list[str]], None] | None = None,
 ) -> list[str]:
-    """Summarise chunks in batches, returning one summary per chunk."""
+    """Summarise chunks in batches, returning one summary per chunk.
+
+    `on_partial` receives each batch's summaries as they are produced, so a
+    caller can show results during a long run instead of after it.
+    """
     import torch
 
     if not chunks:
@@ -263,7 +268,10 @@ def summarize_chunks(
                 early_stopping=True,
             )
 
-        summaries.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
+        decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
+        summaries.extend(decoded)
+        if on_partial is not None:
+            on_partial(decoded)
         _emit(progress, min(start + len(batch), total), total)
 
     return summaries
@@ -326,10 +334,22 @@ def summarize_document(
     batch_size: int = 4,
     budget: Budget | None = None,
     progress: ProgressFn | None = None,
+    on_partial: Callable[[list[str]], None] | None = None,
 ) -> str:
-    """Map-reduce summarisation over an already-bounded set of chunks."""
+    """Map-reduce summarisation over an already-bounded set of chunks.
+
+    `on_partial` sees the map phase only. The reduce phase rewrites those
+    summaries into the final text, so streaming it would show the user work
+    that is about to be replaced.
+    """
     partials = summarize_chunks(
-        chunks, tokenizer, model, batch_size=batch_size, budget=budget, progress=progress
+        chunks,
+        tokenizer,
+        model,
+        batch_size=batch_size,
+        budget=budget,
+        progress=progress,
+        on_partial=on_partial,
     )
     return reduce_summaries(partials, tokenizer, model, batch_size=batch_size, budget=budget)
 

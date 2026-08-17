@@ -1,5 +1,15 @@
-# Development and benchmarking extras, on top of requirements.txt.
--r requirements.txt
+# Test-only dependencies.
+#
+# Deliberately excludes torch and transformers: the test suite covers chunking,
+# retrieval, the time budget and PDF extraction, none of which need a model.
+# That keeps CI to well under a minute instead of downloading a GB of wheels.
+# Model-dependent behaviour is measured by the scripts in benchmarks/.
 
-# Generates the benchmark fixture PDFs.
+pytest==9.1.1
+
+# Extraction backends, so the pdf_extract tests run for real rather than skip.
+pypdfium2==5.13.0
+pdfplumber==0.11.10
+
+# Builds the sample PDF the extraction tests read.
 reportlab==5.0.0
