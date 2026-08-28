@@ -1,0 +1,32 @@
+# Tool configuration. This project installs from requirements*.txt rather than
+# being packaged, so there is no [project] table here.
+
+[tool.mypy]
+python_version = "3.12"
+files = ["PDFread.py", "inference.py", "retrieval.py", "pdf_extract.py", "tests", "benchmarks"]
+
+# Third-party libraries that ship no type information, plus the heavy ones
+# (torch, transformers) that are deliberately absent from the dev environment
+# so the test suite stays fast. Without these overrides mypy reports an import
+# error for each one, which buries any real finding in noise.
+[[tool.mypy.overrides]]
+module = [
+    "torch",
+    "torch.*",
+    "transformers",
+    "transformers.*",
+    "nltk",
+    "nltk.*",
+    "streamlit",
+    "streamlit.*",
+    "pypdfium2",
+    "pypdfium2.*",
+    "pdfplumber",
+    "pdfplumber.*",
+    "reportlab",
+    "reportlab.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

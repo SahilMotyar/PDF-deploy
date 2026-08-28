@@ -20,10 +20,22 @@ def test_search_returns_at_most_k(prose):
     assert len(index.search("energy", k=99)) == len(prose)
 
 
-def test_search_handles_empty_and_unknown_queries(prose):
+def test_query_with_no_matching_term_retrieves_nothing(prose):
+    """Returning arbitrary chunks made the QA model answer from page one.
+
+    Every chunk scores zero, the sort leaves them in document order, and the
+    first k get read as though they were relevant.
+    """
     index = retrieval.ChunkIndex.build(prose)
-    assert index.search("", k=3) == index.search("", k=3)  # deterministic
-    assert len(index.search("zzzz qqqq", k=3)) == 3  # no crash on OOV terms
+    assert index.search("zzzz qqqq", k=3) == []
+    assert index.search("", k=3) == []
+
+
+def test_partial_match_returns_only_the_matching_chunks(prose):
+    """A query matching one chunk must not be padded out to k."""
+    index = retrieval.ChunkIndex.build(prose)
+    hits = index.search("photosynthesis", k=5)
+    assert hits == [3]
 
 
 def test_empty_index_returns_nothing():

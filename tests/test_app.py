@@ -84,3 +84,31 @@ class TestClearDocumentState:
 
         assert PDFread.st.session_state["assistant"] == "keep me"
         assert "summary" not in PDFread.st.session_state
+
+
+class TestOutcomes:
+    """Failures must be distinguishable from results, for every entry point."""
+
+    def test_summary_without_a_document_is_a_failure(self):
+        result = PDFread.PDFAssistant().generate_summary()
+        assert result.ok is False
+        assert "load a PDF" in result.message
+
+    def test_question_without_a_document_is_a_failure(self):
+        result = PDFread.PDFAssistant().answer_question("anything?")
+        assert result.ok is False
+        assert "load a PDF" in result.message
+
+    def test_blank_question_is_a_failure(self, sample_pdf):
+        import io
+
+        assistant = PDFread.PDFAssistant()
+        assistant.read_pdf(io.BytesIO(sample_pdf.read_bytes()))
+        result = assistant.answer_question("   ")
+        assert result.ok is False
+        assert "valid question" in result.message
+
+    def test_outcome_is_immutable(self):
+        outcome = PDFread.Outcome(True, "fine")
+        with pytest.raises(Exception):
+            outcome.ok = False

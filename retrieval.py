@@ -96,7 +96,12 @@ class ChunkIndex:
 
         scores = self.bm25.scores(query)
         ranked = sorted(range(len(self.chunks)), key=lambda i: -scores[i])
-        return ranked[: min(k, len(self.chunks))]
+
+        # Drop chunks that share no term with the query. Without this a
+        # question with no overlap at all scores every chunk zero, the sort
+        # leaves them in document order, and the QA model confidently
+        # answers from page one.
+        return [i for i in ranked if scores[i] > 0][:k]
 
 
 def select_representative(chunks: Sequence[str], limit: int) -> list[int]:

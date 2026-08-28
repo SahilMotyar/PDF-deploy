@@ -16,8 +16,16 @@ import retrieval
 
 
 @dataclass(frozen=True)
-class LoadResult:
-    """Outcome of loading a PDF: whether it worked, and what to tell the user."""
+class Outcome:
+    """What happened, and what to tell the user.
+
+    Every entry point below used to return a bare string whether it
+    succeeded or failed, so the caller could not tell "here is your answer"
+    from "the model would not load" and rendered both as success.
+
+    `ok` is False only when the request could not be served. A search that
+    genuinely found nothing is a successful outcome with a negative answer.
+    """
 
     ok: bool
     message: str
@@ -144,7 +152,7 @@ class PDFAssistant:
     def read_pdf(self, pdf_file):
         """Extract text from a PDF file.
 
-        Returns a LoadResult rather than a bare string. Both outcomes used
+        Returns an Outcome rather than a bare string. Both outcomes used
         to be plain text, so an unreadable document was announced with
         st.success() and still unlocked the Summary and Q&A tabs.
         """
@@ -161,19 +169,19 @@ class PDFAssistant:
             self._chunk_cache.clear()
 
             if not self.pdf_text.strip():
-                return LoadResult(
+                return Outcome(
                     False,
                     "No text could be extracted. The document may be a scan or "
                     "images only, which needs OCR rather than text extraction.",
                 )
 
-            return LoadResult(
+            return Outcome(
                 True,
                 f"PDF loaded successfully. Contains {result.char_count} characters "
                 f"and {result.page_count} pages (read with {result.backend}).",
             )
         except Exception as e:
-            return LoadResult(False, f"Error reading PDF: {str(e)}")
+            return Outcome(False, f"Error reading PDF: {str(e)}")
     
     def _chunks(self, kind, tokenizer, budget_tokens):
         """Token-aware chunks for `kind`, memoised for the loaded document."""
@@ -191,10 +199,10 @@ class PDFAssistant:
         caller can show progress with real content during a long run.
         """
         if not self.pdf_text:
-            return "Please load a PDF first."
+            return Outcome(False, "Please load a PDF first.")
 
         if not self._load_models():
-            return "Failed to load AI models."
+            return Outcome(False, "Failed to load AI models.")
 
         try:
             chunks = [
@@ -206,7 +214,7 @@ class PDFAssistant:
             ]
 
             if not chunks:
-                return "Unable to extract meaningful text from the PDF."
+                return Outcome(False, "Unable to extract meaningful text from the PDF.")
 
             # Cap the map phase so cost and output length stop tracking document
             # length. Sampling across the document beats truncating it.
@@ -234,7 +242,11 @@ class PDFAssistant:
             status_text.empty()
 
             if not summary:
-                return "Could not generate a summary. Try a different document or check document quality."
+                return Outcome(
+                    False,
+                    "Could not generate a summary. Try a different document "
+                    "or check document quality.",
+                )
 
             if len(sampled) < len(chunks):
                 st.caption(
@@ -244,34 +256,39 @@ class PDFAssistant:
 
             self.summary = summary
 
-            return self.summary
+            return Outcome(True, self.summary)
         except Exception as e:
-            st.error(f"Error in summary generation: {str(e)}")
-            return "An error occurred while generating the summary."
+            return Outcome(False, f"Error generating the summary: {e}")
 
     def answer_question(self, question):
         """Answer a question based on the PDF content."""
         if not self.pdf_text:
-            return "Please load a PDF first."
+            return Outcome(False, "Please load a PDF first.")
 
         if not question.strip():
-            return "Please enter a valid question."
+            return Outcome(False, "Please enter a valid question.")
 
         if not self._load_models():
-            return "Failed to load AI models."
+            return Outcome(False, "Failed to load AI models.")
 
         try:
             chunks = self._chunks("qa", self.qa_tokenizer, inference.QA_INPUT_TOKENS)
 
             if not chunks:
-                return "Unable to extract meaningful text from the PDF to answer questions."
+                return Outcome(
+                    False,
+                    "Unable to extract meaningful text from the PDF to answer questions.",
+                )
 
             # Retrieve first: the QA model only reads the handful of chunks
             # worth reading, instead of every chunk in the document.
             index = build_index(chunks)
             candidates = index.search(question, k=retrieval.TOP_K)
             if not candidates:
-                return "I couldn't find an answer to that question in the document."
+                # No chunk shares a single term with the question.
+                return Outcome(
+                    True, "That question does not match anything in the document."
+                )
 
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -292,12 +309,13 @@ class PDFAssistant:
             status_text.empty()
 
             if best is None or not best.text:
-                return "I couldn't find an answer to that question in the document."
+                return Outcome(
+                    True, "I couldn't find an answer to that question in the document."
+                )
 
-            return f"{best.text} (Confidence: {best.score:.2f})"
+            return Outcome(True, f"{best.text} (Confidence: {best.score:.2f})")
         except Exception as e:
-            st.error(f"Error in question answering: {str(e)}")
-            return "An error occurred while processing your question."
+            return Outcome(False, f"Error answering the question: {e}")
 
 
 @st.fragment
@@ -327,11 +345,20 @@ def summary_panel():
                     "\n\n".join(f"- {section}" for section in sections[-4:])
                 )
 
-            summary = st.session_state.assistant.generate_summary(on_partial=on_partial)
+            result = st.session_state.assistant.generate_summary(
+                on_partial=on_partial
+            )
             live.empty()
-            status.update(label="Summary ready", state="complete", expanded=False)
+            status.update(
+                label="Summary ready" if result.ok else "Could not summarise",
+                state="complete" if result.ok else "error",
+                expanded=False,
+            )
 
-        st.session_state.summary = summary
+        if result.ok:
+            st.session_state.summary = result.message
+        else:
+            st.error(result.message)
 
     if st.session_state.get("summary"):
         st.markdown("### Summary Output")
@@ -366,13 +393,19 @@ def qa_panel():
 
     if ask_button and question:
         with st.spinner("Searching for an answer..."):
-            answer = st.session_state.assistant.answer_question(question)
+            result = st.session_state.assistant.answer_question(question)
 
-        st.session_state.last_question = question
-        st.session_state.last_answer = answer
-        # Recorded here, where an answer is actually produced. Appending during
-        # rendering meant the history depended on how often the page reran.
-        st.session_state.setdefault("conversation", []).append((question, answer))
+        if result.ok:
+            st.session_state.last_question = question
+            st.session_state.last_answer = result.message
+            # Recorded here, where an answer is actually produced. Appending
+            # during rendering meant the history depended on how often the
+            # page reran. Failures are shown but not recorded as answers.
+            st.session_state.setdefault("conversation", []).append(
+                (question, result.message)
+            )
+        else:
+            st.error(result.message)
 
     if st.session_state.get("last_answer"):
         st.markdown("### Question")
