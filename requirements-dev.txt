@@ -13,3 +13,8 @@ pdfplumber==0.11.10
 
 # Builds the sample PDF the extraction tests read.
 reportlab==5.0.0
+
+# Lets the suite import PDFread and test document loading and session state.
+# Roughly triples the install (pandas and pyarrow come with it), which is the
+# price of the app module being testable at all. Still no torch.
+streamlit==1.61.1

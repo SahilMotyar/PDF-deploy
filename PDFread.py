@@ -8,9 +8,20 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+from dataclasses import dataclass
+
 import inference
 import pdf_extract
 import retrieval
+
+
+@dataclass(frozen=True)
+class LoadResult:
+    """Outcome of loading a PDF: whether it worked, and what to tell the user."""
+
+    ok: bool
+    message: str
+
 
 SUMMARIZER_MODEL = inference.SUMMARIZER_MODEL
 QA_MODEL = inference.QA_MODEL
@@ -81,6 +92,16 @@ def extract_pdf_cached(pdf_bytes, _progress=None):
     return pdf_extract.extract(pdf_bytes, _progress)
 
 
+def clear_document_state():
+    """Drop everything derived from the previously loaded document.
+
+    Without this, loading a second PDF leaves the first one's summary and
+    Q&A history on screen, where they read as results for the new document.
+    """
+    for key in ("summary", "conversation", "last_question", "last_answer"):
+        st.session_state.pop(key, None)
+
+
 def throttled_progress(bar, step=0.02, status=None, label=""):
     """Return a progress callback that only redraws every `step` of the way.
 
@@ -121,7 +142,12 @@ class PDFAssistant:
             return False
 
     def read_pdf(self, pdf_file):
-        """Extract text from a PDF file."""
+        """Extract text from a PDF file.
+
+        Returns a LoadResult rather than a bare string. Both outcomes used
+        to be plain text, so an unreadable document was announced with
+        st.success() and still unlocked the Summary and Q&A tabs.
+        """
         try:
             pdf_bytes = pdf_file.read()
             pdf_file.seek(0)  # Reset file pointer after reading
@@ -131,20 +157,23 @@ class PDFAssistant:
             progress_bar.empty()
 
             self.pdf_text = result.text
+            self.summary = ""
             self._chunk_cache.clear()
 
             if not self.pdf_text.strip():
-                return (
+                return LoadResult(
+                    False,
                     "No text could be extracted. The document may be a scan or "
-                    "images only, which needs OCR rather than text extraction."
+                    "images only, which needs OCR rather than text extraction.",
                 )
 
-            return (
+            return LoadResult(
+                True,
                 f"PDF loaded successfully. Contains {result.char_count} characters "
-                f"and {result.page_count} pages (read with {result.backend})."
+                f"and {result.page_count} pages (read with {result.backend}).",
             )
         except Exception as e:
-            return f"Error reading PDF: {str(e)}"
+            return LoadResult(False, f"Error reading PDF: {str(e)}")
     
     def _chunks(self, kind, tokenizer, budget_tokens):
         """Token-aware chunks for `kind`, memoised for the loaded document."""
@@ -439,8 +468,16 @@ def main():
             if st.button("Process PDF"):
                 with st.spinner("Reading PDF..."):
                     result = st.session_state.assistant.read_pdf(uploaded_file)
-                    st.session_state.file_processed = True
-                    st.success(result)
+
+                # Results belong to the document they came from, so they go
+                # whether or not the new one loaded.
+                clear_document_state()
+                st.session_state.file_processed = result.ok
+
+                if result.ok:
+                    st.success(result.message)
+                else:
+                    st.error(result.message)
         
         st.markdown('<div class="status-info">', unsafe_allow_html=True)
         st.markdown("**App Status**")
