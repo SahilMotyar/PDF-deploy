@@ -112,3 +112,25 @@ class TestOutcomes:
         outcome = PDFread.Outcome(True, "fine")
         with pytest.raises(Exception):
             outcome.ok = False
+
+
+def test_chunking_survives_a_missing_nltk(monkeypatch, sample_pdf, tokenizer):
+    """A missing NLTK must degrade the sentence split, not fail the request.
+
+    ensure_sentence_tokenizer did a bare `import nltk`, so the ImportError
+    escaped through _chunks() and failed the whole summary or question, even
+    though inference.split_sentences has a fallback for exactly this.
+    """
+    import sys
+
+    monkeypatch.setitem(sys.modules, "nltk", None)
+    PDFread.ensure_sentence_tokenizer.clear()
+    try:
+        assert PDFread.ensure_sentence_tokenizer() is False
+
+        assistant = PDFread.PDFAssistant()
+        assistant.read_pdf(io.BytesIO(sample_pdf.read_bytes()))
+        chunks = assistant._chunks("qa", tokenizer, 40)
+        assert chunks, "chunking produced nothing without NLTK"
+    finally:
+        PDFread.ensure_sentence_tokenizer.clear()

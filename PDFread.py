@@ -45,8 +45,18 @@ QA_TIME_BUDGET = 90
 
 @st.cache_resource(show_spinner=False)
 def ensure_sentence_tokenizer():
-    """Fetch the NLTK sentence tokenizer once per process, not once per rerun."""
-    import nltk
+    """Fetch the NLTK sentence tokenizer once per process, not once per rerun.
+
+    Returns False if NLTK is unavailable. inference.split_sentences falls back
+    to a naive splitter in that case, so a missing or broken NLTK degrades the
+    chunk boundaries rather than failing the request -- but only if the import
+    error is caught here. Uncaught, it escapes through _chunks() and takes the
+    whole summary or question with it.
+    """
+    try:
+        import nltk
+    except Exception:
+        return False
 
     # NLTK 3.9 replaced the `punkt` data package with `punkt_tab`. Accept
     # either so the app works across versions.
